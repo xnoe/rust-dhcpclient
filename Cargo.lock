@@ -31,9 +31,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "dhcprs"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5849fa01b515c56a6247af5121fa38bb22988e2c0f7216d93e5623417a57ea"
+version = "0.1.3"
 dependencies = [
  "eui48",
 ]

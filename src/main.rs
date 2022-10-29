@@ -1,7 +1,7 @@
 pub mod rtnetlink;
+pub mod rawsocket;
 
 use eui48::MacAddress;
-use nix::sys::socket::*;
 use rand::prelude::*;
 use std::net::Ipv4Addr;
 
@@ -9,6 +9,8 @@ use dhcprs::dhcp::DHCPMessageType;
 use dhcprs::dhcp::DHCPOption;
 
 use std::collections::HashMap;
+
+use std::io::Write;
 
 fn create_dhcp_packet(
     xid: u32,
@@ -56,44 +58,40 @@ enum DHCPTransactionState {
     WaitingAfterDiscover,
     Request,
     WaitAfterRequest,
-    Renew,
-    WaitAfterRenew,
-    Rebind,
-    WaitafterRebind,
+    Renew
+}
+
+fn pick_weighted<T>(list: &Vec<T>) -> Option<&T> {
+    let len = list.len();
+    let mut rng = rand::thread_rng();
+    let mut prob = rng.gen_range(0f64..=1f64);
+    
+    println!("start prob={}", prob);
+    for (idx, elem) in list.iter().enumerate() {
+        let weight = 1f64 / (2 as usize).pow(idx as u32 + (len != idx + 1) as u32) as f64;
+    
+        prob -= weight;
+        
+        println!("len={} idx={}: weight={}, prob={}", len, idx, weight, prob);
+        
+        if prob <= 0.0 {
+            return Some(elem);
+        }
+        
+    }
+    
+    // fallback in case of float rounding errors i suppose
+    list.choose(&mut rng)
 }
 
 fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
+    unsafe { libc::sleep(5); }
+    let mut name = name;
+    let mut socket_nl = rtnetlink::create_netlink_socket(false).unwrap();
     let mut rng = rand::thread_rng();
     // Before we can do anything else, we need to construct an LinkAddr for the mac ff:ff:ff:ff:ff:ff
 
-    let sockaddr_ll = libc::sockaddr_ll {
-        sll_family: libc::AF_PACKET as u16,
-        sll_halen: 6,
-        sll_hatype: 1,
-        sll_ifindex: index,
-        sll_addr: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0],
-        sll_pkttype: 0,
-        sll_protocol: 0x0008,
-    };
-
-    let mut linkaddr = unsafe {
-        LinkAddr::from_raw(
-            &sockaddr_ll as *const libc::sockaddr_ll as *const libc::sockaddr,
-            Some(20),
-        )
-        .expect("Failed to create linkaddr!")
-    };
-
-    // Create and bind the socket
-    let socket = socket(
-        AddressFamily::Packet,
-        SockType::Datagram,
-        SockFlag::empty(),
-        SockProtocol::Udp,
-    )
-    .expect("Failed to create socket! Permission issue?");
-    assert!(setsockopt(socket, sockopt::Broadcast, &true).is_ok());
-    assert!(bind(socket, &linkaddr).is_ok());
+    let mut socket = rawsocket::create_raw_socket(index, mac).unwrap();
 
     let client_mac = MacAddress::from_bytes(&mac).unwrap();
 
@@ -109,10 +107,9 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
         'dhcp_message_loop: loop {
             match &dhcp_state {
                 DHCPTransactionState::Discover => {
-                    println!("Sent DHCPDiscover on {}", name);
                     loop {
-                        match sendto(
-                            socket,
+                        println!("Sent DHCPDiscover on {}", name);
+                        match socket.send(
                             create_dhcp_packet(
                                 xid,
                                 client_mac,
@@ -123,15 +120,65 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                                     DHCPOption::End,
                                 ],
                             )
-                            .as_bytes(),
-                            &linkaddr,
-                            MsgFlags::empty(),
+                            .as_bytes()
                         ) {
                             Ok(_) => break,
-                            Err(nix::errno::Errno::ENETDOWN) => {
-                                unsafe { libc::sleep(3) };
+                            Err(libc::ENETDOWN) => {
+                                unsafe {
+                                    {
+                                        #[repr(packed)]
+                                        struct Request {a: libc::nlmsghdr, b: rtnetlink::ifinfomsg}
+                                        let mut request = std::mem::zeroed::<Request>();
+            
+                                        request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                                        request.a.nlmsg_type = libc::RTM_NEWLINK;
+                                        request.a.nlmsg_flags = (libc::NLM_F_REQUEST) as u16;
+                                        request.b.ifi_index = index;
+                                        request.b.ifi_flags = libc::IFF_UP as u32;
+                                        request.b.ifi_change = 1;
+            
+                                        socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+                                    }
+
+                                    {
+                                        #[repr(packed)]
+                                        struct Request {a: libc::nlmsghdr, b: rtnetlink::ifinfomsg}
+                                        let mut request = std::mem::zeroed::<Request>();
+            
+                                        request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                                        request.a.nlmsg_type = libc::RTM_GETLINK;
+                                        request.a.nlmsg_flags = (libc::NLM_F_REQUEST) as u16;
+                                        request.b.ifi_index = index;
+            
+                                        socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+
+                                        let mut buffer = [0; 4096];
+                                        socket_nl.recv(&mut buffer).unwrap();
+
+                                        let nlmsghdr = &buffer as *const _ as *const libc::nlmsghdr;
+                                        if (*nlmsghdr).nlmsg_type != libc::RTM_NEWLINK {
+                                            panic!("Wrong message!");
+                                        }
+
+                                        let mut n = (*nlmsghdr).nlmsg_len - std::mem::size_of::<libc::nlmsghdr>() as u32 - std::mem::size_of::<rtnetlink::ifinfomsg>() as u32;
+                                        let mut rtattr = (&buffer as *const _ as *const u8).offset(std::mem::size_of::<libc::nlmsghdr>() as isize + std::mem::size_of::<rtnetlink::ifinfomsg>() as isize) as *const rtnetlink::rtattr;
+
+                                        while rtnetlink::rta_ok(rtattr, &mut n) {
+                                            match (*rtattr).rta_type {
+                                                libc::IFLA_IFNAME => {
+                                                    name = zascii(&std::ptr::read(rtnetlink::rta_data(rtattr) as *const _ as *const [libc::c_char; libc::IFNAMSIZ]));
+                                                }
+                                                _ => ()
+                                            }
+
+                                            rtattr = rtnetlink::rta_next(rtattr, &mut n);
+                                        }
+                                    }
+
+                                    libc::sleep(10);
+                                }
                             }
-                            Err(_) => panic!("")
+                            Err(_) => panic!("Failed to send on {}", name)
                         }
                     }
                     dhcp_state = DHCPTransactionState::WaitingAfterDiscover;
@@ -139,9 +186,7 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
 
                 DHCPTransactionState::WaitingAfterDiscover => {
                     let mut packet: [u8; 574] = [0; 574];
-                    let (bytes, addr) = recvfrom::<LinkAddr>(socket, &mut packet).unwrap();
-
-                    println!("Received {} bytes on {}", bytes, name);
+                    let (_, addr) = socket.recv(&mut packet).unwrap();
 
                     let udppacket_raw: dhcprs::udpbuilder::RawUDPPacket =
                         unsafe { std::ptr::read(packet.as_ptr() as *const _) };
@@ -194,33 +239,14 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                     );
 
                     // Update the linkaddr to be the server's actual hardware address rather than the broadcast MAC.
-                    let mut mac: [u8; 8] = [0; 8];
-                    mac[..6].copy_from_slice(&addr.unwrap().addr().unwrap());
-                    let new_sockaddr_ll = libc::sockaddr_ll {
-                        sll_family: sockaddr_ll.sll_family,
-                        sll_halen: sockaddr_ll.sll_halen,
-                        sll_hatype: sockaddr_ll.sll_hatype,
-                        sll_ifindex: sockaddr_ll.sll_ifindex,
-                        sll_addr: mac,
-                        sll_pkttype: sockaddr_ll.sll_pkttype,
-                        sll_protocol: sockaddr_ll.sll_protocol,
-                    };
-
-                    linkaddr = unsafe {
-                        LinkAddr::from_raw(
-                            &new_sockaddr_ll as *const libc::sockaddr_ll as *const libc::sockaddr,
-                            Some(20),
-                        )
-                        .expect("Failed to update linkaddr to server's hardware address!")
-                    };
+                    socket.set_destination_to(addr);
 
                     dhcp_state = DHCPTransactionState::Request;
                 }
 
                 DHCPTransactionState::Request => {
                     println!("Sent DHCPRequest on {}", name);
-                    let _ = sendto(
-                        socket,
+                    socket.send(
                         create_dhcp_packet(
                             xid,
                             client_mac,
@@ -234,17 +260,14 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                                 DHCPOption::End,
                             ],
                         )
-                        .as_bytes(),
-                        &linkaddr,
-                        MsgFlags::empty(),
-                    );
+                        .as_bytes()
+                    ).unwrap();
                     dhcp_state = DHCPTransactionState::WaitAfterRequest;
                 }
 
                 DHCPTransactionState::WaitAfterRequest => {
                     let mut packet: [u8; 574] = [0; 574];
-                    let (bytes, _) = recvfrom::<LinkAddr>(socket, &mut packet).unwrap();
-                    println!("Received {} bytes on {}", bytes, name);
+                    socket.recv(&mut packet).unwrap();
 
                     let udppacket_raw: dhcprs::udpbuilder::RawUDPPacket =
                         unsafe { std::ptr::read(packet.as_ptr() as *const _) };
@@ -285,22 +308,168 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                     }
 
                     let mut sleep_time = 0;
+                    let mut subnet_mask = Ipv4Addr::new(0,0,0,0);
+                    let mut router = Vec::new();
+                    let mut dns = Vec::new();
+                    let mut classless_static_routes = Vec::new();
 
                     for option in options {
                         println!("Received: {:?}", option);
 
                         match option {
                             DHCPOption::IPAddressLeaseTime(n) => sleep_time = n,
+                            DHCPOption::SubnetMask(m) => subnet_mask = m,
+                            DHCPOption::Router(v) => router = v,
+                            DHCPOption::DomainNameServer(v) => dns = v,
+                            DHCPOption::ClasslessStaticRoute(v) => classless_static_routes = v,
 
                             _ => (),
                         }
                     }
 
-                    println!("Sleeping for {} for lease time to elapse.", sleep_time);
-                    std::thread::sleep(core::time::Duration::new(sleep_time.into(), 0));
+                    unsafe {
+                        {
+                            #[repr(packed)]
+                            struct Request {a: libc::nlmsghdr, b: rtnetlink::ifaddrmsg, c: rtnetlink::rtattr, d: [u8; 4], e: rtnetlink::rtattr, f: [u8; 4], g: rtnetlink::rtattr, h: rtnetlink::ifa_cacheinfo}
+                            let mut request = std::mem::zeroed::<Request>();
+
+                            request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                            request.a.nlmsg_type = libc::RTM_NEWADDR;
+                            request.a.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_REPLACE) as u16;
+                            request.b.ifa_family = libc::AF_INET as u8;
+                            request.b.ifa_index = index;
+                            request.b.ifa_prefixlen = u32::from(subnet_mask).leading_ones() as u8;
+                            request.c.rta_type = libc::IFA_LOCAL;
+                            request.c.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                            request.d = client_addr.unwrap().octets();
+                            request.e.rta_type = libc::IFA_BROADCAST;
+                            request.e.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                            request.f = ((u32::from(client_addr.unwrap()) & u32::from(subnet_mask)) | (!u32::from(subnet_mask))).to_be_bytes();
+                            request.g.rta_type = libc::IFA_CACHEINFO;
+                            request.g.rta_len = std::mem::size_of::<(rtnetlink::rtattr, rtnetlink::ifa_cacheinfo)>() as u16;
+                            request.h.ifa_preferred = (sleep_time as f32 * 0.5) as u32;
+                            request.h.ifa_valid = (sleep_time as f32 * 0.875) as u32;
+
+                            socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+                        }
+
+                        {
+                            #[repr(packed)]
+                            struct Request {a: libc::nlmsghdr, b: rtnetlink::rtmsg, c: rtnetlink::rtattr, d: [u8; 4], e: rtnetlink::rtattr, f: libc::c_int, g: rtnetlink::rtattr, h: rtnetlink::rta_cacheinfo}
+
+                            let mut request = std::mem::zeroed::<Request>();
+
+                            request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                            request.a.nlmsg_type = libc::RTM_NEWROUTE;
+                            request.a.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16;
+                            request.b.rtm_family = libc::AF_INET as u8;
+                            request.b.rtm_table = libc::RT_TABLE_MAIN;
+                            request.b.rtm_type = libc::RTN_UNICAST;
+                            request.b.rtm_protocol = 16; // DHCP
+                            request.b.rtm_scope = libc::RT_SCOPE_LINK;
+                            request.b.rtm_dst_len = u32::from(subnet_mask).leading_ones() as u8;
+                            request.c.rta_type = libc::RTA_DST;
+                            request.c.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                            request.d = client_addr.unwrap().octets();
+                            request.e.rta_type = libc::RTA_OIF;
+                            request.e.rta_len = std::mem::size_of::<(rtnetlink::rtattr, libc::c_int)>() as u16;
+                            request.f = index;
+                            request.g.rta_type = libc::RTA_CACHEINFO;
+                            request.g.rta_len = std::mem::size_of::<(rtnetlink::rtattr, rtnetlink::rta_cacheinfo)>() as u16;
+                            request.h.rta_expires = (sleep_time as f32 * 0.875) as u32;
+
+                            socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+                        }
+
+                        {
+                            #[repr(packed)]
+                            struct Request {a: libc::nlmsghdr, b: rtnetlink::rtmsg, c: rtnetlink::rtattr, d: [u8; 4], e: rtnetlink::rtattr, f: libc::c_int, g: rtnetlink::rtattr, h: rtnetlink::rta_cacheinfo}
+
+                            let mut request = std::mem::zeroed::<Request>();
+
+                            request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                            request.a.nlmsg_type = libc::RTM_NEWROUTE;
+                            request.a.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16;
+                            request.b.rtm_family = libc::AF_INET as u8;
+                            request.b.rtm_table = libc::RT_TABLE_MAIN;
+                            request.b.rtm_type = libc::RTN_UNICAST;
+                            request.b.rtm_protocol = 16; // DHCP
+                            request.b.rtm_scope = libc::RT_SCOPE_UNIVERSE;
+                            request.b.rtm_dst_len = 0;
+                            request.c.rta_type = libc::RTA_GATEWAY;
+                            request.c.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                            request.d = pick_weighted(&router).unwrap().octets();
+                            request.e.rta_type = libc::RTA_OIF;
+                            request.e.rta_len = std::mem::size_of::<(rtnetlink::rtattr, libc::c_int)>() as u16;
+                            request.f = index;
+                            request.g.rta_type = libc::RTA_CACHEINFO;
+                            request.g.rta_len = std::mem::size_of::<(rtnetlink::rtattr, rtnetlink::rta_cacheinfo)>() as u16;
+                            request.h.rta_expires = (sleep_time as f32 * 0.875) as u32;
+
+                            socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+                        }
+
+                        {
+                            #[repr(packed)]
+                            struct Request {a: libc::nlmsghdr, b: rtnetlink::rtmsg, c: rtnetlink::rtattr, d: [u8; 4], e: rtnetlink::rtattr, f: [u8; 4], g: rtnetlink::rtattr, h: libc::c_int}
+
+                            for (prefix, prefix_len, router) in classless_static_routes {
+                                let mut request = std::mem::zeroed::<Request>();
+
+                                request.a.nlmsg_len = std::mem::size_of::<Request>() as u32;
+                                request.a.nlmsg_type = libc::RTM_NEWROUTE;
+                                request.a.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_CREATE) as u16;
+                                request.b.rtm_family = libc::AF_INET as u8;
+                                request.b.rtm_table = libc::RT_TABLE_MAIN;
+                                request.b.rtm_type = libc::RTN_UNICAST;
+                                request.b.rtm_protocol = 16; // DHCP
+                                request.b.rtm_scope = libc::RT_SCOPE_UNIVERSE;
+                                request.b.rtm_dst_len = prefix_len;
+                                request.c.rta_type = libc::RTA_DST;
+                                request.c.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                                request.d = prefix.octets();
+                                request.e.rta_type = libc::RTA_GATEWAY;
+                                request.e.rta_len = std::mem::size_of::<(rtnetlink::rtattr, [u8; 4])>() as u16;
+                                request.f = router.octets();
+                                request.g.rta_type = libc::RTA_OIF;
+                                request.g.rta_len = std::mem::size_of::<(rtnetlink::rtattr, libc::c_int)>() as u16;
+                                request.h = index;
+                                
+
+                                socket_nl.send(rtnetlink::to_slice(&request)).unwrap();
+                            }
+                        }
+
+                        let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open("/etc/resolv.conf").unwrap();
+                        for server in dns {
+                            f.write_all(("nameserver ".to_string() + &server.to_string() + "\n").as_bytes()).unwrap();
+                        }
+                        f.flush().unwrap();
+                    }
+
+                    println!("Sleeping for {} for lease time to elapse.", (sleep_time as f32 * 0.5) as u32);
+                    std::thread::sleep(core::time::Duration::new((sleep_time as f32 * 0.5) as u64, 0));
+                    dhcp_state = DHCPTransactionState::Renew
                 }
 
-                _ => panic!("Fail!"),
+                DHCPTransactionState::Renew => {
+                    println!("[Renew] Sent DHCPRequest on {}", name);
+                    let _ = socket.send(
+                        create_dhcp_packet(
+                            xid,
+                            client_mac,
+                            client_addr,
+                            None,
+                            vec![
+                                DHCPOption::DHCPMessageType(DHCPMessageType::DHCPRequest),
+                                DHCPOption::ParameterRequest(vec![1, 3, 6, 28, 121]),
+                                DHCPOption::End,
+                            ],
+                        )
+                        .as_bytes()
+                    );
+                    dhcp_state = DHCPTransactionState::WaitAfterRequest;
+                }
             }
         }
     }

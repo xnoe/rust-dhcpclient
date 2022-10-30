@@ -8,7 +8,7 @@ pub struct RawSocket {
     socket: libc::c_int,
     src_addr: libc::sockaddr_ll,
     dest_addr: libc::sockaddr_ll,
-    if_index: i32
+    if_index: i32,
 }
 
 pub fn create_raw_socket(index: i32, mac: [u8; 6]) -> Result<RawSocket, &'static str> {
@@ -42,15 +42,34 @@ pub fn create_raw_socket(index: i32, mac: [u8; 6]) -> Result<RawSocket, &'static
         let mut timeval = std::mem::zeroed::<libc::timeval>();
         timeval.tv_sec = 30;
 
-        if libc::setsockopt(socket, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &timeval as *const _ as *const libc::c_void, std::mem::size_of::<libc::timeval>() as u32) == -1 {
+        if libc::setsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as u32,
+        ) == -1
+        {
             return Err("Failed to set SO_RCVTIMEO");
         }
 
-        if libc::setsockopt(socket, libc::SOL_SOCKET, libc::SO_BROADCAST, &(1 as u32) as *const _ as *const libc::c_void, std::mem::size_of::<u32>() as u32) == -1 {
-            return Err("Failed to set SO_BROADCAST")
+        if libc::setsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_BROADCAST,
+            &(1 as u32) as *const _ as *const libc::c_void,
+            std::mem::size_of::<u32>() as u32,
+        ) == -1
+        {
+            return Err("Failed to set SO_BROADCAST");
         }
 
-        if libc::bind(socket, &src_addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_ll>() as u32) == -1 {
+        if libc::bind(
+            socket,
+            &src_addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        ) == -1
+        {
             return Err("Failed to bind to socket");
         }
     }
@@ -59,7 +78,7 @@ pub fn create_raw_socket(index: i32, mac: [u8; 6]) -> Result<RawSocket, &'static
         socket: socket,
         src_addr: src_addr,
         dest_addr: dest_addr,
-        if_index: index
+        if_index: index,
     })
 }
 
@@ -69,7 +88,7 @@ impl RawSocket {
             iov_base: msg as *const _ as *mut libc::c_void,
             iov_len: msg.len() as usize,
         };
-    
+
         let mut msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
         msg.msg_name = &mut self.dest_addr as *mut _ as *mut libc::c_void;
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_ll>() as u32;
@@ -100,10 +119,16 @@ impl RawSocket {
         if n < 0 {
             match unsafe { *libc::__errno_location() } {
                 libc::EAGAIN => return Ok((0, [0, 0, 0, 0, 0, 0])),
-                err => return Err(err)
+                err => return Err(err),
             }
         } else {
-            return Ok((n, unsafe { std::ptr::read(msg.msg_name as *mut _ as *mut libc::sockaddr_ll) }.sll_addr[..6].try_into().unwrap()));
+            return Ok((
+                n,
+                unsafe { std::ptr::read(msg.msg_name as *mut _ as *mut libc::sockaddr_ll) }
+                    .sll_addr[..6]
+                    .try_into()
+                    .unwrap(),
+            ));
         }
     }
 

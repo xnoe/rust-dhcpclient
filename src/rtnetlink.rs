@@ -155,7 +155,7 @@ unsafe fn ifla_rta(r: *const ifinfomsg) -> *const rtattr {
 pub struct Socket {
     socket: libc::c_int,
     src_addr: libc::sockaddr_nl,
-    dest_addr: libc::sockaddr_nl
+    dest_addr: libc::sockaddr_nl,
 }
 
 pub fn create_netlink_socket(subscribed: bool) -> Result<Socket, &'static str> {
@@ -177,7 +177,12 @@ pub fn create_netlink_socket(subscribed: bool) -> Result<Socket, &'static str> {
             return Err("Failed to create socket");
         }
 
-        if libc::bind(socket, &src_addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32) == -1 {
+        if libc::bind(
+            socket,
+            &src_addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        ) == -1
+        {
             return Err("Failed to bind to socket");
         }
     }
@@ -185,7 +190,7 @@ pub fn create_netlink_socket(subscribed: bool) -> Result<Socket, &'static str> {
     Ok(Socket {
         socket: socket,
         src_addr: src_addr,
-        dest_addr: dest_addr
+        dest_addr: dest_addr,
     })
 }
 
@@ -195,7 +200,7 @@ impl Socket {
             iov_base: msg as *const _ as *mut libc::c_void,
             iov_len: msg.len() as usize,
         };
-    
+
         let mut msg = unsafe { std::mem::zeroed::<libc::msghdr>() };
         msg.msg_name = &mut self.dest_addr as *mut _ as *mut libc::c_void;
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_ll>() as u32;
@@ -239,10 +244,7 @@ pub struct InterfaceIterator {
 }
 
 pub unsafe fn to_slice<T: Sized>(p: &T) -> &[u8] {
-    std::slice::from_raw_parts(
-        (p as *const T) as *const u8,
-        std::mem::size_of::<T>(),
-    )
+    std::slice::from_raw_parts((p as *const T) as *const u8, std::mem::size_of::<T>())
 }
 
 pub fn new_interface_iterator() -> Result<InterfaceIterator, &'static str> {
@@ -254,7 +256,9 @@ pub fn new_interface_iterator() -> Result<InterfaceIterator, &'static str> {
     request.0.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
     request.1.ifi_family = libc::AF_NETLINK as u8;
 
-    socket.send(unsafe {to_slice(&request)}).expect("Failed to send interface request!");
+    socket
+        .send(unsafe { to_slice(&request) })
+        .expect("Failed to send interface request!");
 
     Ok(InterfaceIterator {
         socket: socket,

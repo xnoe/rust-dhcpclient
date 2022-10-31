@@ -588,7 +588,7 @@ fn zascii(slice: &[libc::c_char]) -> String {
 }
 
 fn main() {
-    let mut thread_map: HashMap<[u8; 6], libc::c_int> = HashMap::new();
+    let mut thread_map: HashMap<i32, libc::c_int> = HashMap::new();
     let iterator = rtnetlink::new_interface_iterator().unwrap();
 
     for message in iterator {
@@ -600,7 +600,7 @@ fn main() {
                 let name = zascii(&interface.name);
                 println!("New Link");
 
-                if let None = thread_map.get(&interface.hwaddr) {
+                if let None = thread_map.get(&interface.index) {
                     println!("Starting DHCP on {}", name);
                     unsafe {
                         match libc::fork() {
@@ -608,7 +608,7 @@ fn main() {
                             0 => dhcp_client(name, interface.index, interface.hwaddr),
                             pid => {
                                 println!("Started DHCP on {} PID {}", name, pid);
-                                thread_map.insert(interface.hwaddr, pid);
+                                thread_map.insert(interface.index, pid);
                             }
                         }
                     }
@@ -619,12 +619,12 @@ fn main() {
                 let name = zascii(&interface.name);
                 println!("Del Link");
 
-                if let Some(pid) = thread_map.get(&interface.hwaddr) {
+                if let Some(pid) = thread_map.get(&interface.index) {
                     println!("Stopping DHCP on {}", name);
                     unsafe {
                         libc::kill(*pid, libc::SIGTERM);
                     }
-                    thread_map.remove(&interface.hwaddr);
+                    thread_map.remove(&interface.index);
                 }
             }
         }

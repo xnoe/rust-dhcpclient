@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 use std::io::Write;
 
+use std::str;
+
 fn create_dhcp_packet(
     xid: u32,
     mac: MacAddress,
@@ -92,9 +94,19 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
     let mut socket = rawsocket::create_raw_socket(index, mac).unwrap();
 
     let client_mac = MacAddress::from_bytes(&mac).unwrap();
+    let client_id: Vec<u8> = vec![1].into_iter().chain(mac.to_vec().into_iter()).collect();
 
     let mut client_addr: Option<Ipv4Addr> = None;
     let mut server_addr: Option<Ipv4Addr> = None;
+
+    // Determine hostname.
+    let mut hostname_raw: [u8; 64] = [0; 64];
+    unsafe {
+        libc::gethostname(&mut hostname_raw as *mut _ as *mut libc::c_char, 64);
+    }
+    let length = hostname_raw.iter().position(|&i| i == 0).unwrap();
+    let hostname = str::from_utf8(&hostname_raw[..length]).unwrap_or("").to_owned();
+    println!("Hostname: {}", hostname);
 
     // DHCP transaction loop
     'dhcp_transaction: loop {
@@ -115,6 +127,8 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                                 None,
                                 vec![
                                     DHCPOption::DHCPMessageType(DHCPMessageType::DHCPDiscover),
+                                    DHCPOption::HostName(hostname.clone()),
+                                    DHCPOption::ClientIdentifier(client_id.clone()),
                                     DHCPOption::End,
                                 ],
                             )
@@ -269,6 +283,8 @@ fn dhcp_client(name: String, index: i32, mac: [u8; 6]) {
                                     DHCPOption::RequestIPAddress(client_addr.unwrap()),
                                     DHCPOption::ServerIdentifier(server_addr.unwrap()),
                                     DHCPOption::ParameterRequest(vec![1, 3, 6, 28, 121]),
+                                    DHCPOption::HostName(hostname.clone()),
+                                    DHCPOption::ClientIdentifier(client_id.clone()),
                                     DHCPOption::End,
                                 ],
                             )
